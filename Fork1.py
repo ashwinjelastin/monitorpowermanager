@@ -4,20 +4,14 @@ import threading
 import subprocess
 import time
 import keyboard
-from datetime import datetime
 
 # Core Windows OS libraries
 user32 = ctypes.windll.user32
 ole32 = ctypes.windll.ole32
 dwmapi = ctypes.windll.dwmapi
 
+# Initialize COM for the main thread
 ole32.CoInitialize(0)
-
-# ==========================================
-# SCRIPT SETTINGS
-# ==========================================
-SLEEP_TIMEOUT = 15.0  # Seconds to wait before turning the monitor off
-# ==========================================
 
 # Windows Constants
 EVENT_SYSTEM_FOREGROUND = 0x0003
@@ -26,7 +20,6 @@ EVENT_OBJECT_DESTROY = 0x8001
 OBJID_WINDOW = 0
 WINEVENT_OUTOFCONTEXT = 0x0000
 MONITOR_DEFAULTTONEAREST = 0x00000002
-MONITORINFOF_PRIMARY = 0x00000001
 PM_REMOVE = 0x0001
 WM_QUIT = 0x0012
 
@@ -64,45 +57,39 @@ WINEVENTPROC = ctypes.WINFUNCTYPE(None, ctypes.c_void_p, ctypes.wintypes.DWORD, 
 WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.wintypes.BOOL, ctypes.c_void_p, ctypes.c_void_p)
 
 # State
-last_known_apps = {}
+last_known_counts = {}
 check_timer = None
 monitor_sleep_timer = None
 print_lock = threading.Lock()
 current_display_mode = "extend"
 exit_flag = False
 
-def log(msg, level="INFO"):
-    timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-    with print_lock:
-        print(f"[{timestamp}] [{level}] {msg}")
-
 def execute_display_switch(mode):
-    log(f"Executing DisplaySwitch.exe /{mode}...", "ACTION")
+    """Runs DisplaySwitch in a background thread to prevent blocking timers"""
     if mode == "internal":
         subprocess.run(["DisplaySwitch.exe", "/internal"], shell=True)
     elif mode == "extend":
         subprocess.run(["DisplaySwitch.exe", "/extend"], shell=True)
-    log(f"DisplaySwitch finished.", "ACTION")
 
 def switch_display_mode(mode):
     global current_display_mode
     if current_display_mode == mode:
         return 
     
-    log(f"Switching display mode to: {mode.upper()}", "SYSTEM")
+    with print_lock:
+        print(f"\n[SYSTEM] Switching display mode to: {mode.upper()}")
+        
+    # Send to background thread
     threading.Thread(target=execute_display_switch, args=(mode,), daemon=True).start()
     current_display_mode = mode
 
 def trigger_sleep():
     global monitor_sleep_timer
     monitor_sleep_timer = None
-    log("Timer complete! Putting Secondary Monitor to sleep.", "ACTION")
     switch_display_mode("internal")
 
 def wake_monitor():
-    log("Manual wake triggered. Giving the monitor time to turn on...", "ACTION")
     switch_display_mode("extend")
-    # This quick check kicks off the 15-second grace period countdown
     threading.Timer(1.0, queue_app_check).start()
 
 def monitor_mouse_corner():
@@ -111,8 +98,10 @@ def monitor_mouse_corner():
     
     while not exit_flag:
         if current_display_mode == "internal":
+            # BUG FIX 1: Fetch metrics inside the loop so resolution changes are caught
             screen_width = user32.GetSystemMetrics(0) 
             screen_height = user32.GetSystemMetrics(1) 
+            
             user32.GetCursorPos(ctypes.byref(pt))
             
             in_corner = (pt.x >= screen_width - 2) and (pt.y >= screen_height - 2)
@@ -120,7 +109,8 @@ def monitor_mouse_corner():
             if in_corner: 
                 edge_time += 0.1
                 if edge_time >= 1.0:  
-                    log("Bottom-right corner bump detected! Waking up monitor...", "EVENT")
+                    with print_lock:
+                        print("\n[SYSTEM] Bottom-right corner bump detected! Waking up monitor...")
                     wake_monitor()
                     edge_time = 0
             else:
@@ -132,21 +122,12 @@ def get_monitor_name(h_monitor):
     if not h_monitor: return "Unknown Monitor"
     monitor_info = MONITORINFOEXW()
     monitor_info.cbSize = ctypes.sizeof(MONITORINFOEXW)
-    
     if user32.GetMonitorInfoW(h_monitor, ctypes.byref(monitor_info)):
-        if monitor_info.dwFlags & MONITORINFOF_PRIMARY:
-            return "Primary Monitor"
-        else:
-            return "Secondary Monitor"
-            
+        device_path = monitor_info.szDevice
+        if "DISPLAY" in device_path:
+            return f"Monitor {device_path.split('DISPLAY')[-1]}"
+        return device_path
     return "Unknown Monitor"
-
-def get_window_title(hwnd):
-    length = user32.GetWindowTextLengthW(hwnd)
-    if length == 0: return ""
-    buff = ctypes.create_unicode_buffer(length + 1)
-    user32.GetWindowTextW(hwnd, buff, length + 1)
-    return buff.value.strip()
 
 def is_cloaked(hwnd):
     cloaked = ctypes.c_int(0)
@@ -154,7 +135,7 @@ def is_cloaked(hwnd):
         return cloaked.value != 0 
     return False
 
-def is_real_window(hwnd, title):
+def is_real_window(hwnd):
     if not user32.IsWindowVisible(hwnd) or user32.IsIconic(hwnd) or is_cloaked(hwnd): 
         return False
     
@@ -166,65 +147,68 @@ def is_real_window(hwnd, title):
     if (ex_style & WS_EX_TOOLWINDOW) and not (ex_style & WS_EX_APPWINDOW):
         return False
 
+    length = user32.GetWindowTextLengthW(hwnd)
+    if length == 0: return False
+    buff = ctypes.create_unicode_buffer(length + 1)
+    user32.GetWindowTextW(hwnd, buff, length + 1)
+    title = buff.value.strip()
+    
     ignore_list = [
         "Program Manager", "Settings", "Microsoft Text Input Application",
-        "System tray overflow window.", "Task View", "Taskbar", 
-        "Windows Input Experience", "NVIDIA GeForce Overlay", 
-        "PopupHost", "CiceroUIWndFrame"
+        "System tray overflow window.", "Task View", "Taskbar"
     ]
-    
     if title in ignore_list or title == "": 
         return False
     
     return True
 
 def check_and_log_app_counts():
-    global last_known_apps, monitor_sleep_timer
+    global last_known_counts, monitor_sleep_timer
+    
+    # BUG FIX 2: Initialize COM for the background thread to prevent DWM crashes
     ole32.CoInitialize(0)
     
     try:
-        current_apps = {}
-        
-        def enum_windows_callback(hwnd, lParam):
-            title = get_window_title(hwnd)
-            if is_real_window(hwnd, title):
-                h_mon = user32.MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
-                mon_name = get_monitor_name(h_mon)
-                
-                if mon_name not in current_apps:
-                    current_apps[mon_name] = []
-                current_apps[mon_name].append(title)
-            return True
+        with print_lock:
+            current_counts = {}
+            def enum_windows_callback(hwnd, lParam):
+                if is_real_window(hwnd):
+                    h_mon = user32.MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
+                    mon_name = get_monitor_name(h_mon)
+                    current_counts[mon_name] = current_counts.get(mon_name, 0) + 1
+                return True
 
-        enum_func = WNDENUMPROC(enum_windows_callback)
-        user32.EnumWindows(enum_func, 0)
-        
-        apps_on_secondary = current_apps.get("Secondary Monitor", [])
-        
-        if len(apps_on_secondary) == 0 and current_display_mode == "extend":
-            if monitor_sleep_timer is None:
-                log(f"Secondary Monitor is empty. Starting {SLEEP_TIMEOUT}-second sleep countdown...", "TIMER")
-                monitor_sleep_timer = threading.Timer(SLEEP_TIMEOUT, trigger_sleep)
-                monitor_sleep_timer.start()
-                
-        elif len(apps_on_secondary) > 0:
-            if monitor_sleep_timer is not None:
-                monitor_sleep_timer.cancel()
-                monitor_sleep_timer = None
-                log(f"Sleep timer CANCELLED! App(s) keeping Secondary awake: {apps_on_secondary}", "WARNING")
-                
-        if current_apps != last_known_apps:
-            log("App distribution changed! Current State:", "UPDATE")
-            with print_lock:
-                print("-----------------------------------------")
-                for mon in sorted(current_apps.keys()):
-                    print(f" {mon} ({len(current_apps[mon])} apps): {current_apps[mon]}")
-                if not current_apps:
-                    print(" No active apps detected on any monitor.")
-                print("-----------------------------------------")
-            last_known_apps = current_apps
+            enum_func = WNDENUMPROC(enum_windows_callback)
+            user32.EnumWindows(enum_func, 0)
             
+            apps_on_monitor_2 = current_counts.get("Monitor 2", 0)
+            
+            if apps_on_monitor_2 == 0 and current_display_mode == "extend":
+                if monitor_sleep_timer is None:
+                    print("\n[SYSTEM] Monitor 2 is empty. Waiting 2 seconds before sleeping...")
+                    monitor_sleep_timer = threading.Timer(2.0, trigger_sleep)
+                    monitor_sleep_timer.start()
+                    
+            elif apps_on_monitor_2 > 0:
+                if monitor_sleep_timer is not None:
+                    monitor_sleep_timer.cancel()
+                    monitor_sleep_timer = None
+                    print("\n[SYSTEM] Sleep timer cancelled. App detected on Monitor 2.")
+                    
+            if current_counts != last_known_counts:
+                print("\n[UPDATE] App distribution changed!")
+                print("--- Current Open Apps Summary ---")
+                
+                for mon in sorted(current_counts.keys()):
+                    print(f"{mon}: {current_counts[mon]} apps")
+                    
+                if not current_counts:
+                    print("No active apps detected on any monitor.")
+                print("---------------------------------")
+                
+                last_known_counts = current_counts
     finally:
+        # BUG FIX 2: Uninitialize COM when done
         ole32.CoUninitialize()
 
 def queue_app_check():
@@ -237,20 +221,17 @@ def window_change_callback(hWinEventHook, event, hwnd, idObject, idChild, dwEven
     if not hwnd: return
     if event == EVENT_OBJECT_DESTROY and idObject != OBJID_WINDOW: return
     
-    if event == EVENT_SYSTEM_FOREGROUND:
-        log("Hook fired: Foreground window changed.", "DEBUG")
-    elif event == EVENT_SYSTEM_MOVESIZEEND:
-        log("Hook fired: Window move/resize ended.", "DEBUG")
-        
     queue_app_check()
 
 def quit_app():
+    """Helper to gracefully exit"""
     global exit_flag
-    log("Stopping monitor. Cleaning up threads...", "SYSTEM")
+    print("\nStopping monitor...")
     exit_flag = True
 
 callback_wrapper = WINEVENTPROC(window_change_callback)
 
+# BUG FIX 3: Hook Foreground and Move/Size End separately to avoid spamming the API
 hook_ui_fg = user32.SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, 0, callback_wrapper, 0, 0, WINEVENT_OUTOFCONTEXT)
 hook_ui_move = user32.SetWinEventHook(EVENT_SYSTEM_MOVESIZEEND, EVENT_SYSTEM_MOVESIZEEND, 0, callback_wrapper, 0, 0, WINEVENT_OUTOFCONTEXT)
 hook_destroy = user32.SetWinEventHook(EVENT_OBJECT_DESTROY, EVENT_OBJECT_DESTROY, 0, callback_wrapper, 0, 0, WINEVENT_OUTOFCONTEXT)
@@ -258,23 +239,22 @@ hook_destroy = user32.SetWinEventHook(EVENT_OBJECT_DESTROY, EVENT_OBJECT_DESTROY
 if not hook_ui_fg or not hook_ui_move or not hook_destroy: exit(1)
 
 keyboard.add_hotkey('ctrl+alt+e', wake_monitor)
+# Added a reliable hotkey exit mapping
 keyboard.add_hotkey('ctrl+q', quit_app) 
 
 mouse_thread = threading.Thread(target=monitor_mouse_corner, daemon=True)
 mouse_thread.start()
 
-print("=====================================================")
-print("      Automated Display & App Monitor Running        ")
-print("=====================================================")
-print(f"-> Auto-sleep ({SLEEP_TIMEOUT}s delay) enabled for Secondary Monitor.")
-print("-> To wake up: Mouse into BOTTOM-RIGHT for 1s OR Ctrl+Alt+E.")
-print("-> To quit: Press Ctrl+Q in any window.")
-print("=====================================================\n")
+print("--- Automated Display & App Monitor Running ---")
+print("-> Auto-sleep (2s delay) enabled for Monitor 2.")
+print("-> To wake up: Push mouse into the BOTTOM-RIGHT corner for 1s OR press Ctrl+Alt+E.")
+print("-> Press Ctrl+Q in any window to stop the script.\n")
 
 check_and_log_app_counts()
 
 msg = ctypes.wintypes.MSG()
 
+# BUG FIX 4: Non-blocking message loop to allow the script to catch exit flags
 try:
     while not exit_flag:
         if user32.PeekMessageW(ctypes.byref(msg), 0, 0, 0, PM_REMOVE):
@@ -283,7 +263,7 @@ try:
             user32.TranslateMessage(ctypes.byref(msg))
             user32.DispatchMessageW(ctypes.byref(msg))
         else:
-            time.sleep(0.01) 
+            time.sleep(0.01) # Yield CPU
 finally:
     if monitor_sleep_timer is not None:
         monitor_sleep_timer.cancel()
@@ -293,4 +273,3 @@ finally:
     user32.UnhookWinEvent(hook_ui_move)
     user32.UnhookWinEvent(hook_destroy)
     ole32.CoUninitialize()
-    log("Exited safely.", "SYSTEM")
