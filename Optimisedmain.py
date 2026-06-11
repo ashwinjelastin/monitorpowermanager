@@ -2,7 +2,6 @@ import ctypes
 import ctypes.wintypes
 import threading
 import subprocess
-import time
 from datetime import datetime
 import pystray
 from PIL import Image, ImageDraw
@@ -28,6 +27,14 @@ WS_VISIBLE = 0x10000000
 WS_EX_TOOLWINDOW = 0x00000080
 WS_EX_APPWINDOW = 0x00040000
 DWMWA_CLOAKED = 14
+
+# OPTIMIZATION 1: Global Set for O(1) Instant Lookups
+IGNORE_APPS = {
+    "Program Manager", "Settings", "Microsoft Text Input Application",
+    "System tray overflow window.", "Task View", "Taskbar", 
+    "Windows Input Experience", "NVIDIA GeForce Overlay", 
+    "PopupHost", "CiceroUIWndFrame", ""
+}
 
 class MONITORINFOEXW(ctypes.Structure):
     _fields_ = [
@@ -57,8 +64,10 @@ last_known_apps = {}
 monitor_sleep_timer = None
 print_lock = threading.Lock()
 current_display_mode = "extend"
-exit_flag = False
 tray_icon = None
+
+# OPTIMIZATION 4: Threading Event for zero-CPU halting
+exit_event = threading.Event()
 
 def log(msg, level="INFO"):
     timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
@@ -96,12 +105,13 @@ def monitor_mouse_corner():
     pt = POINT()
     edge_time = 0
     
-    while not exit_flag:
+    # Cache dimensions initially
+    screen_width = user32.GetSystemMetrics(0) 
+    screen_height = user32.GetSystemMetrics(1) 
+    
+    while not exit_event.is_set():
         if current_display_mode == "internal":
-            screen_width = user32.GetSystemMetrics(0) 
-            screen_height = user32.GetSystemMetrics(1) 
             user32.GetCursorPos(ctypes.byref(pt))
-            
             in_corner = (pt.x >= screen_width - 2) and (pt.y >= screen_height - 2)
             
             if in_corner: 
@@ -112,8 +122,17 @@ def monitor_mouse_corner():
                     edge_time = 0
             else:
                 edge_time = 0 
-                
-        time.sleep(0.1)
+            
+            # Wait 0.1s natively
+            exit_event.wait(0.1)
+        else:
+            # OPTIMIZATION 3: If monitor is already awake, refresh metrics and chill
+            edge_time = 0 
+            screen_width = user32.GetSystemMetrics(0) 
+            screen_height = user32.GetSystemMetrics(1) 
+            
+            # Wait a full second. We don't need to track the mouse aggressively right now.
+            exit_event.wait(1.0)
 
 def get_monitor_name(h_monitor):
     if not h_monitor: return "Unknown Monitor"
@@ -142,26 +161,16 @@ def is_cloaked(hwnd):
     return False
 
 def is_real_window(hwnd, title):
+    if title in IGNORE_APPS: return False
+
     if not user32.IsWindowVisible(hwnd) or user32.IsIconic(hwnd) or is_cloaked(hwnd): 
         return False
     
     style = user32.GetWindowLongW(hwnd, GWL_STYLE)
     ex_style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
     
-    if not (style & WS_VISIBLE): 
-        return False
-    if (ex_style & WS_EX_TOOLWINDOW) and not (ex_style & WS_EX_APPWINDOW):
-        return False
-
-    ignore_list = [
-        "Program Manager", "Settings", "Microsoft Text Input Application",
-        "System tray overflow window.", "Task View", "Taskbar", 
-        "Windows Input Experience", "NVIDIA GeForce Overlay", 
-        "PopupHost", "CiceroUIWndFrame"
-    ]
-    
-    if title in ignore_list or title == "": 
-        return False
+    if not (style & WS_VISIBLE): return False
+    if (ex_style & WS_EX_TOOLWINDOW) and not (ex_style & WS_EX_APPWINDOW): return False
     
     return True
 
@@ -208,19 +217,16 @@ def check_and_log_app_counts():
             print("-----------------------------------------")
         last_known_apps = current_apps
 
-# ==========================================
-# BACKGROUND HEARTBEAT
-# ==========================================
 def app_polling_loop():
-    """Runs continuously in the background, entirely decoupled from UI events"""
     ole32.CoInitialize(0)
     try:
-        while not exit_flag:
-            check_and_log_app_counts()
-            # Sleep in tiny chunks so it can exit instantly if you quit the app
-            for _ in range(int(POLL_INTERVAL * 10)):
-                if exit_flag: break
-                time.sleep(0.1)
+        while not exit_event.is_set():
+            # OPTIMIZATION 2: Only poll Windows APIs if the secondary screen is actually ON
+            if current_display_mode == "extend":
+                check_and_log_app_counts()
+            
+            # Park thread efficiently until next cycle or exit signal
+            exit_event.wait(POLL_INTERVAL)
     finally:
         ole32.CoUninitialize()
 
@@ -239,9 +245,8 @@ def on_tray_wake(icon, item):
     wake_monitor()
 
 def on_tray_quit(icon, item):
-    global exit_flag
     log("Quit selected from tray. Cleaning up...", "SYSTEM")
-    exit_flag = True
+    exit_event.set()  # Signals all threads to shut down immediately
     icon.stop()
 
 def run_tray_icon():
@@ -255,7 +260,6 @@ def run_tray_icon():
             pystray.MenuItem("Quit", on_tray_quit)
         )
     )
-    # This blocks the main thread and safely handles the Windows message loop natively
     tray_icon.run()
 
 # ==========================================
@@ -273,13 +277,12 @@ if __name__ == "__main__":
     print("=====================================================")
     print(f"-> Auto-sleep ({SLEEP_TIMEOUT}s delay) enabled.")
     print(f"-> Heartbeat set to {POLL_INTERVAL}s to prevent DWM flashing.")
+    print("-> Ultra-low Resource Mode: ACTIVE.")
     print("-> Check your System Tray (clock area) to manage or quit.")
     print("=====================================================\n")
 
-    # This will hijack the main thread and keep the script alive
     run_tray_icon()
 
-    # Once you click Quit in the tray, it drops down here to clean up
     if monitor_sleep_timer is not None:
         monitor_sleep_timer.cancel()
     log("Exited safely.", "SYSTEM")
