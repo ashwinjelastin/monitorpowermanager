@@ -1,0 +1,5 @@
+Add number of monitor detection.
+optimise code
+application window with all window options
+add credits
+turn on monitor trigger options
