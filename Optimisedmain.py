@@ -5,19 +5,19 @@ import subprocess
 from datetime import datetime
 import pystray
 from PIL import Image, ImageDraw
- 
+
 # Core Windows OS libraries
 user32 = ctypes.windll.user32
 ole32 = ctypes.windll.ole32
 dwmapi = ctypes.windll.dwmapi
- 
+
 # ==========================================
 # SCRIPT SETTINGS
 # ==========================================
 SLEEP_TIMEOUT = 15.0  # Seconds to wait before turning the monitor off
 POLL_INTERVAL = 2.0   # How often to check for apps (Heartbeat)
 # ==========================================
- 
+
 # Windows Constants
 MONITOR_DEFAULTTONEAREST = 0x00000002
 MONITORINFOF_PRIMARY = 0x00000001
@@ -27,7 +27,7 @@ WS_VISIBLE = 0x10000000
 WS_EX_TOOLWINDOW = 0x00000080
 WS_EX_APPWINDOW = 0x00040000
 DWMWA_CLOAKED = 14
- 
+
 # OPTIMIZATION 1: Global Set for O(1) Instant Lookups
 IGNORE_APPS = {
     "Program Manager", "Settings", "Microsoft Text Input Application",
@@ -35,7 +35,7 @@ IGNORE_APPS = {
     "Windows Input Experience", "NVIDIA GeForce Overlay", 
     "PopupHost", "CiceroUIWndFrame", ""
 }
- 
+
 class MONITORINFOEXW(ctypes.Structure):
     _fields_ = [
         ("cbSize", ctypes.wintypes.DWORD),
@@ -44,10 +44,10 @@ class MONITORINFOEXW(ctypes.Structure):
         ("dwFlags", ctypes.wintypes.DWORD),
         ("szDevice", ctypes.wintypes.WCHAR * 32)
     ]
- 
+
 class POINT(ctypes.Structure):
     _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
- 
+
 # Setup Monitor and Window functions
 user32.MonitorFromWindow.argtypes = [ctypes.c_void_p, ctypes.wintypes.DWORD]
 user32.MonitorFromWindow.restype = ctypes.c_void_p
@@ -58,30 +58,30 @@ user32.IsIconic.restype = ctypes.wintypes.BOOL
 dwmapi.DwmGetWindowAttribute.argtypes = [ctypes.c_void_p, ctypes.wintypes.DWORD, ctypes.c_void_p, ctypes.wintypes.DWORD]
 dwmapi.DwmGetWindowAttribute.restype = ctypes.HRESULT
 WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.wintypes.BOOL, ctypes.c_void_p, ctypes.c_void_p)
- 
+
 # Global State
 last_known_apps = {}
 monitor_sleep_timer = None
 print_lock = threading.Lock()
 current_display_mode = "extend"
 tray_icon = None
- 
+
 # OPTIMIZATION 4: Threading Event for zero-CPU halting
 exit_event = threading.Event()
- 
+
 def log(msg, level="INFO"):
     timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
     with print_lock:
         print(f"[{timestamp}] [{level}] {msg}")
- 
+
 def execute_display_switch(mode):
     log(f"Executing DisplaySwitch.exe /{mode}...", "ACTION")
     if mode == "internal":
-        subprocess.run(["DisplaySwitch.exe", "/internal"], creationflags=subprocess.CREATE_NO_WINDOW)
+        subprocess.run(["DisplaySwitch.exe", "/internal"], shell=True)
     elif mode == "extend":
-        subprocess.run(["DisplaySwitch.exe", "/extend"], creationflags=subprocess.CREATE_NO_WINDOW)
+        subprocess.run(["DisplaySwitch.exe", "/extend"], shell=True)
     log("DisplaySwitch finished.", "ACTION")
- 
+
 def switch_display_mode(mode):
     global current_display_mode
     if current_display_mode == mode:
@@ -90,17 +90,17 @@ def switch_display_mode(mode):
     log(f"Switching display mode to: {mode.upper()}", "SYSTEM")
     threading.Thread(target=execute_display_switch, args=(mode,), daemon=True).start()
     current_display_mode = mode
- 
+
 def trigger_sleep():
     global monitor_sleep_timer
     monitor_sleep_timer = None
     log("Timer complete! Putting Secondary Monitor to sleep.", "ACTION")
     switch_display_mode("internal")
- 
+
 def wake_monitor():
     log("Manual wake triggered. Giving the monitor time to turn on...", "ACTION")
     switch_display_mode("extend")
- 
+
 def monitor_mouse_corner():
     pt = POINT()
     edge_time = 0
@@ -133,7 +133,7 @@ def monitor_mouse_corner():
             
             # Wait a full second. We don't need to track the mouse aggressively right now.
             exit_event.wait(1.0)
- 
+
 def get_monitor_name(h_monitor):
     if not h_monitor: return "Unknown Monitor"
     monitor_info = MONITORINFOEXW()
@@ -146,23 +146,23 @@ def get_monitor_name(h_monitor):
             return "Secondary Monitor"
             
     return "Unknown Monitor"
- 
+
 def get_window_title(hwnd):
     length = user32.GetWindowTextLengthW(hwnd)
     if length == 0: return ""
     buff = ctypes.create_unicode_buffer(length + 1)
     user32.GetWindowTextW(hwnd, buff, length + 1)
     return buff.value.strip()
- 
+
 def is_cloaked(hwnd):
     cloaked = ctypes.c_int(0)
     if dwmapi.DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, ctypes.byref(cloaked), ctypes.sizeof(cloaked)) == 0:
         return cloaked.value != 0 
     return False
- 
+
 def is_real_window(hwnd, title):
     if title in IGNORE_APPS: return False
- 
+
     if not user32.IsWindowVisible(hwnd) or user32.IsIconic(hwnd) or is_cloaked(hwnd): 
         return False
     
@@ -173,7 +173,7 @@ def is_real_window(hwnd, title):
     if (ex_style & WS_EX_TOOLWINDOW) and not (ex_style & WS_EX_APPWINDOW): return False
     
     return True
- 
+
 def check_and_log_app_counts():
     global last_known_apps, monitor_sleep_timer
     current_apps = {}
@@ -188,7 +188,7 @@ def check_and_log_app_counts():
                 current_apps[mon_name] = []
             current_apps[mon_name].append(title)
         return True
- 
+
     enum_func = WNDENUMPROC(enum_windows_callback)
     user32.EnumWindows(enum_func, 0)
     
@@ -216,7 +216,7 @@ def check_and_log_app_counts():
                 print(" No active apps detected on any monitor.")
             print("-----------------------------------------")
         last_known_apps = current_apps
- 
+
 def app_polling_loop():
     ole32.CoInitialize(0)
     try:
@@ -229,7 +229,7 @@ def app_polling_loop():
             exit_event.wait(POLL_INTERVAL)
     finally:
         ole32.CoUninitialize()
- 
+
 # ==========================================
 # SYSTEM TRAY LOGIC
 # ==========================================
@@ -240,15 +240,15 @@ def create_tray_image():
     dc.rectangle((28, 44, 36, 54), fill=(255, 255, 255))
     dc.rectangle((20, 54, 44, 58), fill=(255, 255, 255))
     return image
- 
+
 def on_tray_wake(icon, item):
     wake_monitor()
- 
+
 def on_tray_quit(icon, item):
     log("Quit selected from tray. Cleaning up...", "SYSTEM")
     exit_event.set()  # Signals all threads to shut down immediately
     icon.stop()
- 
+
 def run_tray_icon():
     global tray_icon
     tray_icon = pystray.Icon(
@@ -261,17 +261,17 @@ def run_tray_icon():
         )
     )
     tray_icon.run()
- 
+
 # ==========================================
 # INITIALIZATION
 # ==========================================
 if __name__ == "__main__":
     mouse_thread = threading.Thread(target=monitor_mouse_corner, daemon=True)
     mouse_thread.start()
- 
+
     polling_thread = threading.Thread(target=app_polling_loop, daemon=True)
     polling_thread.start()
- 
+
     print("=====================================================")
     print("      Automated Display & App Monitor Running        ")
     print("=====================================================")
@@ -280,9 +280,9 @@ if __name__ == "__main__":
     print("-> Ultra-low Resource Mode: ACTIVE.")
     print("-> Check your System Tray (clock area) to manage or quit.")
     print("=====================================================\n")
- 
+
     run_tray_icon()
- 
+
     if monitor_sleep_timer is not None:
         monitor_sleep_timer.cancel()
     log("Exited safely.", "SYSTEM")
