@@ -1,3 +1,4 @@
+switch to main monitor on startup
 Add number of monitor detection.
 optimise code
 application window with all window options
