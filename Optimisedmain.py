@@ -281,6 +281,11 @@ if __name__ == "__main__":
     print("-> Check your System Tray (clock area) to manage or quit.")
     print("=====================================================\n")
 
+    # FIX: Initialize an immediate check right at startup. 
+    # If the secondary monitor is active but empty on boot, this will trigger the 15s timer.
+    log("Performing initial startup display scan...", "SYSTEM")
+    check_and_log_app_counts()
+
     run_tray_icon()
 
     if monitor_sleep_timer is not None:
