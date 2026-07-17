@@ -1,4 +1,6 @@
-switch to main monitor on startup
+add .spec files to ignore list
+monitor status check after windows sign in
+switch to main monitor on startup.
 Add number of monitor detection.
 optimise code
 application window with all window options
